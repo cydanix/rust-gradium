@@ -1,0 +1,26 @@
+[package]
+name = "rust-gradium"
+version = "0.1.0"
+edition = "2021"
+authors = ["Gradium AI"]
+description = "Rust client library for Gradium AI Text-to-Speech (TTS) and Speech-to-Text (STT) WebSocket APIs"
+license = "MIT"
+repository = "https://github.com/cydanix/rust-gradium"
+keywords = ["tts", "stt", "speech", "websocket", "gradium"]
+categories = ["multimedia::audio", "api-bindings"]
+
+[dependencies]
+tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+thiserror = "2.0"
+uuid = { version = "1.0", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+
