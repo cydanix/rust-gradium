@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message;
@@ -10,12 +11,50 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::Error;
 use crate::messages::*;
-use crate::queue::BoundedQueue;
 use crate::ws::WebSocket;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const QUEUE_CAPACITY: usize = 1024;
+
+/// Events emitted by the STT client.
+#[derive(Debug, Clone)]
+pub enum SttEvent {
+    /// The STT client is ready.
+    Ready {
+        /// Request ID for this session.
+        request_id: String,
+        /// Model name being used.
+        model_name: String,
+        /// Expected sample rate.
+        sample_rate: i32,
+    },
+    /// User is inactive (no speech detected).
+    UserInactive {
+        /// Inactivity probability (0.0 - 1.0).
+        inactivity_prob: f32,
+    },
+    /// A word/text was recognized.
+    Text {
+        /// Recognized text.
+        text: String,
+        /// Start time in seconds.
+        start: f32,
+    },
+    /// End of a recognized phrase.
+    EndText {
+        /// Stop time in seconds.
+        stop: f32,
+    },
+    /// An error occurred.
+    Error {
+        /// Error message.
+        message: String,
+        /// Error code.
+        code: i32,
+    },
+    /// End of stream.
+    EndOfStream,
+}
 
 /// Configuration for the STT client.
 #[derive(Debug, Clone)]
@@ -46,27 +85,31 @@ impl SttConfig {
 pub struct SttClient {
     config: SttConfig,
     conn: RwLock<Option<Arc<WebSocket>>>,
-    text_queue: Arc<BoundedQueue<String>>,
     ready: Arc<AtomicBool>,
     error_count: Arc<AtomicU32>,
     stopping: Arc<AtomicBool>,
     read_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
     session_id: String,
+    event_tx: UnboundedSender<SttEvent>,
 }
 
 impl SttClient {
     /// Creates a new STT client with the given configuration.
-    pub fn new(config: SttConfig) -> Self {
-        Self {
+    ///
+    /// Returns the client and an event receiver for receiving STT events.
+    pub fn new(config: SttConfig) -> (Self, UnboundedReceiver<SttEvent>) {
+        let (event_tx, event_rx) = unbounded_channel();
+        let client = Self {
             config,
             conn: RwLock::new(None),
-            text_queue: Arc::new(BoundedQueue::new(QUEUE_CAPACITY)),
             ready: Arc::new(AtomicBool::new(false)),
             error_count: Arc::new(AtomicU32::new(0)),
             stopping: Arc::new(AtomicBool::new(false)),
             read_task: RwLock::new(None),
             session_id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
-        }
+            event_tx,
+        };
+        (client, event_rx)
     }
 
     /// Starts the STT client, connecting to the server and waiting for ready state.
@@ -77,7 +120,6 @@ impl SttClient {
         self.ready.store(false, Ordering::SeqCst);
         self.error_count.store(0, Ordering::SeqCst);
         self.stopping.store(false, Ordering::SeqCst);
-        self.text_queue.clear().await;
 
         // Connect
         let conn = WebSocket::connect(&self.config.endpoint, &self.config.api_key).await?;
@@ -89,13 +131,13 @@ impl SttClient {
 
         // Start read task
         let read_conn = Arc::clone(&conn);
-        let text_queue = Arc::clone(&self.text_queue);
         let ready = Arc::clone(&self.ready);
         let error_count = Arc::clone(&self.error_count);
         let session_id = self.session_id.clone();
+        let event_tx = self.event_tx.clone();
 
         *self.read_task.write().await = Some(tokio::spawn(async move {
-            Self::read_messages(read_conn, text_queue, ready, error_count, session_id).await;
+            Self::read_messages(read_conn, ready, error_count, session_id, event_tx).await;
         }));
 
         // Wait for ready
@@ -143,16 +185,6 @@ impl SttClient {
             return Err(Error::NotReady);
         }
         self.send_audio(audio).await
-    }
-
-    /// Retrieves up to `size` text chunks from the queue.
-    pub async fn get_text(&self, size: usize) -> Vec<String> {
-        self.text_queue.get(size).await
-    }
-
-    /// Returns the number of text chunks available in the queue.
-    pub async fn get_text_size(&self) -> usize {
-        self.text_queue.len().await
     }
 
     /// Returns true if the client is ready and running.
@@ -217,10 +249,10 @@ impl SttClient {
 
     async fn read_messages(
         conn: Arc<WebSocket>,
-        text_queue: Arc<BoundedQueue<String>>,
         ready: Arc<AtomicBool>,
         error_count: Arc<AtomicU32>,
         session_id: String,
+        event_tx: UnboundedSender<SttEvent>,
     ) {
         info!(session_id = %session_id, "STT reading messages");
 
@@ -270,6 +302,11 @@ impl SttClient {
                         "STT ready"
                     );
                     ready.store(true, Ordering::SeqCst);
+                    let _ = event_tx.send(SttEvent::Ready {
+                        request_id: msg.request_id,
+                        model_name: msg.model_name,
+                        sample_rate: msg.sample_rate,
+                    });
                 }
                 "text" => {
                     let msg: SttTextMessage = match serde_json::from_str(&text) {
@@ -280,11 +317,10 @@ impl SttClient {
                         }
                     };
                     debug!(text = %msg.text, start = msg.start, "STT word");
-                    // Add space prefix like the Go implementation
-                    if let Err(e) = text_queue.append(vec![format!(" {}", msg.text)]).await {
-                        error!(error = %e, "Text queue append error");
-                        return;
-                    }
+                    let _ = event_tx.send(SttEvent::Text {
+                        text: msg.text,
+                        start: msg.start,
+                    });
                 }
                 "end_text" => {
                     let msg: SttEndTextMessage = match serde_json::from_str(&text) {
@@ -295,17 +331,24 @@ impl SttClient {
                         }
                     };
                     debug!(stop = msg.stop, "STT end text");
+                    let _ = event_tx.send(SttEvent::EndText { stop: msg.stop });
                 }
                 "step" => {
-                    // Step messages with VAD info - just log at debug level
-                    let _msg: SttStepMessage = match serde_json::from_str(&text) {
+                    // Step messages with VAD info
+                    let msg: SttStepMessage = match serde_json::from_str(&text) {
                         Ok(m) => m,
                         Err(e) => {
                             error!(error = %e, "Failed to parse step message");
                             return;
                         }
                     };
-                    // Don't log step messages by default as they're verbose
+
+                    if msg.vad.len() > 2 && msg.vad[2].inactivity_prob > 0.5 {
+                        info!(session_id = %session_id, inactivity_prob = msg.vad[2].inactivity_prob, "User is inactive");
+                        let _ = event_tx.send(SttEvent::UserInactive {
+                            inactivity_prob: msg.vad[2].inactivity_prob,
+                        });
+                    }
                 }
                 "error" => {
                     let msg: ErrorMessage = match serde_json::from_str(&text) {
@@ -317,10 +360,15 @@ impl SttClient {
                     };
                     error!(message = %msg.message, code = msg.code, "STT error");
                     error_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = event_tx.send(SttEvent::Error {
+                        message: msg.message,
+                        code: msg.code,
+                    });
                     return;
                 }
                 "end_of_stream" => {
                     info!("STT end of stream");
+                    let _ = event_tx.send(SttEvent::EndOfStream);
                     return;
                 }
                 other => {

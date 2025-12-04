@@ -2,7 +2,7 @@
 //!
 //! To run these tests, set the GRADIUM_API_KEY environment variable.
 
-use rust_gradium::{SttClient, SttConfig, TtsClient, TtsConfig, DEFAULT_VOICE_ID, STT_ENDPOINT, TTS_ENDPOINT};
+use rust_gradium::{SttClient, SttConfig, SttEvent, TtsClient, TtsConfig, TtsEvent, DEFAULT_VOICE_ID, STT_ENDPOINT, TTS_ENDPOINT};
 use tracing::info;
 
 fn get_api_key() -> Option<String> {
@@ -30,7 +30,7 @@ async fn test_tts_connection() {
         api_key,
     );
 
-    let client = TtsClient::new(config);
+    let (client, _events) = TtsClient::new(config);
 
     let result = client.start().await;
     assert!(result.is_ok(), "Failed to start TTS: {:?}", result.err());
@@ -42,6 +42,8 @@ async fn test_tts_connection() {
 
 #[tokio::test]
 async fn test_tts_synthesis() {
+    use base64::Engine;
+
     let api_key = match get_api_key() {
         Some(key) => key,
         None => {
@@ -61,21 +63,37 @@ async fn test_tts_synthesis() {
         api_key,
     );
 
-    let client = TtsClient::new(config);
+    let (client, mut events) = TtsClient::new(config);
     client.start().await.expect("Failed to start TTS");
 
     // Send text for synthesis
     client.process("Hello, world!").await.expect("Failed to send text");
-    client.shutdown().await;
 
-    // Get audio chunks
-    let audio = client.get_speech(100).await;
-    eprintln!("Received {} audio chunks", audio.len());
-    assert!(!audio.is_empty(), "Should have received audio chunks");
+    // Collect audio chunks from events
+    let mut audio_chunks = Vec::new();
+    let timeout = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                TtsEvent::Audio { audio } => {
+                    audio_chunks.push(audio);
+                }
+                TtsEvent::EndOfStream => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    client.shutdown().await;
+    let _ = timeout.await;
+
+    eprintln!("Received {} audio chunks", audio_chunks.len());
+    assert!(!audio_chunks.is_empty(), "Should have received audio chunks");
 
     // Verify audio is base64 encoded
-    for chunk in &audio {
-        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, chunk);
+    for chunk in &audio_chunks {
+        let decoded = base64::engine::general_purpose::STANDARD.decode(chunk);
         assert!(decoded.is_ok(), "Audio chunk should be valid base64");
     }
 }
@@ -97,7 +115,7 @@ async fn test_stt_connection() {
 
     let config = SttConfig::new(STT_ENDPOINT.to_string(), api_key);
 
-    let client = SttClient::new(config);
+    let (client, _events) = SttClient::new(config);
 
     let result = client.start().await;
     assert!(result.is_ok(), "Failed to start STT: {:?}", result.err());
@@ -110,9 +128,8 @@ async fn test_stt_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_tts_stt_round_trip() {
     use base64::Engine;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use tokio::sync::{Mutex, RwLock};
+    use tokio::sync::Mutex;
 
     let api_key = match get_api_key() {
         Some(key) => key,
@@ -172,84 +189,62 @@ async fn test_tts_stt_round_trip() {
         base64::engine::general_purpose::STANDARD.encode(downsample_48_to_24(&bytes))
     }
 
-    const TICK_TIME: std::time::Duration = std::time::Duration::from_millis(80);
-
     // Start TTS
     let tts_config = TtsConfig::new(
         TTS_ENDPOINT.to_string(),
         DEFAULT_VOICE_ID.to_string(),
         api_key.clone(),
     );
-    let tts = Arc::new(RwLock::new(TtsClient::new(tts_config)));
-    {
-        let tts_guard = tts.read().await;
-        tts_guard.start().await.expect("Failed to start TTS");
-    }
+    let (tts, mut tts_events) = TtsClient::new(tts_config);
+    tts.start().await.expect("Failed to start TTS");
 
     // Start STT
     let stt_config = SttConfig::new(STT_ENDPOINT.to_string(), api_key);
-    let stt = Arc::new(RwLock::new(SttClient::new(stt_config)));
-    {
-        let stt_guard = stt.read().await;
-        stt_guard.start().await.expect("Failed to start STT");
-    }
+    let (stt, mut stt_events) = SttClient::new(stt_config);
+    stt.start().await.expect("Failed to start STT");
 
-    let exiting = Arc::new(AtomicBool::new(false));
     let full_text = Arc::new(Mutex::new(String::new()));
+    let stt = Arc::new(stt);
+    let tts = Arc::new(tts);
 
-    // Audio forwarding task: TTS -> STT
-    let tts_clone = Arc::clone(&tts);
+    // Spawn audio forwarding task: TTS events -> STT (must run concurrently!)
     let stt_clone = Arc::clone(&stt);
-    let exiting_clone = Arc::clone(&exiting);
     let audio_task = tokio::spawn(async move {
-        while !exiting_clone.load(Ordering::SeqCst) {
-            let data = {
-                let tts_guard = tts_clone.read().await;
-                tts_guard.get_speech(1000).await
-            };
-
-            if data.is_empty() {
-                tokio::time::sleep(TICK_TIME).await;
-                continue;
-            }
-
-            for audio in data {
-                let downsampled = downsample_48_to_24_base64(&audio);
-                let stt_guard = stt_clone.read().await;
-                if let Err(e) = stt_guard.process(&downsampled).await {
-                    eprintln!("Failed to process audio: {}", e);
-                    return;
+        while let Some(event) = tts_events.recv().await {
+            match event {
+                TtsEvent::Audio { audio } => {
+                    let downsampled = downsample_48_to_24_base64(&audio);
+                    if let Err(e) = stt_clone.process(&downsampled).await {
+                        eprintln!("Failed to process audio: {}", e);
+                        break;
+                    }
                 }
+                TtsEvent::EndOfStream => {
+                    info!("TTS EndOfStream received");
+                    break;
+                }
+                _ => {}
             }
-
-            tokio::time::sleep(TICK_TIME).await;
         }
     });
 
-    // Text collection task
-    let stt_clone2 = Arc::clone(&stt);
-    let exiting_clone2 = Arc::clone(&exiting);
+    // Spawn text collection task: STT events -> full_text (must run concurrently!)
     let full_text_clone = Arc::clone(&full_text);
     let text_task = tokio::spawn(async move {
-        while !exiting_clone2.load(Ordering::SeqCst) {
-            let texts = {
-                let stt_guard = stt_clone2.read().await;
-                stt_guard.get_text(1000).await
-            };
-
-            if texts.is_empty() {
-                tokio::time::sleep(TICK_TIME).await;
-                continue;
-            }
-
-            {
-                let mut full = full_text_clone.lock().await;
-                for text in texts {
-                    eprintln!("STT text: {}", text);
+        while let Some(event) = stt_events.recv().await {
+            match event {
+                SttEvent::Text { text, .. } => {
+                    info!("STT text: {}", text);
+                    let mut full = full_text_clone.lock().await;
+                    full.push(' ');
                     full.push_str(&text);
                 }
+                SttEvent::EndOfStream => {
+                    info!("STT EndOfStream received");
+                    break;
+                }
+                _ => {}
             }
-            tokio::time::sleep(TICK_TIME).await;
         }
     });
 
@@ -258,33 +253,26 @@ async fn test_tts_stt_round_trip() {
 
     // Send words one by one
     for word in original_text.split_whitespace() {
-        let tts_guard = tts.read().await;
-        tts_guard.process(word).await.expect("Failed to enqueue text");
+        tts.process(word).await.expect("Failed to enqueue text");
     }
 
-    // Shutdown TTS (sends EOS, waits for all audio)
-    {
-        let tts_guard = tts.read().await;
-        tts_guard.shutdown().await;
-    }
+    // Shutdown TTS (sends EOS, triggers EndOfStream event)
+    tts.shutdown().await;
 
-    // Shutdown STT (sends EOS, waits for all text)
-    {
-        let stt_guard = stt.read().await;
-        stt_guard.shutdown().await;
-    }
+    // Wait for audio task to complete (it will exit on TTS EndOfStream)
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), audio_task).await;
 
-    // Signal tasks to exit
-    exiting.store(true, Ordering::SeqCst);
+    // Shutdown STT (sends EOS, triggers EndOfStream event)
+    stt.shutdown().await;
 
-    // Wait for tasks
-    let _ = audio_task.await;
-    let _ = text_task.await;
+    // Wait for text task to complete (it will exit on STT EndOfStream)
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), text_task).await;
 
     // Compare results
     let full_text_result = full_text.lock().await.clone();
     let scores = rust_gradium::textsim::compare(&full_text_result, original_text);
 
+    info!("Original text: {}", original_text);
     info!("Full text: {}", full_text_result);
     info!(
         "Scores: WER={:.3}, CER={:.3}, TokenF1={:.3}, Similarity={:.3}",
@@ -312,4 +300,3 @@ async fn test_tts_stt_round_trip() {
         scores.similarity
     );
 }
-

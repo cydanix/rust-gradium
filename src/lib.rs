@@ -3,7 +3,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use rust_gradium::{TtsClient, TtsConfig};
+//! use rust_gradium::{TtsClient, TtsConfig, TtsEvent};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), rust_gradium::Error> {
@@ -15,13 +15,22 @@
 //!         output_format: "pcm".to_string(),
 //!     };
 //!
-//!     let client = TtsClient::new(config);
+//!     let (client, mut events) = TtsClient::new(config);
 //!     client.start().await?;
 //!
 //!     client.process("Hello, world!").await?;
 //!
-//!     // Get audio chunks
-//!     let audio = client.get_speech(10).await;
+//!     // Receive audio chunks via events
+//!     while let Some(event) = events.recv().await {
+//!         match event {
+//!             TtsEvent::Audio { audio } => {
+//!                 // Process base64-encoded audio
+//!                 println!("Received audio chunk: {} bytes", audio.len());
+//!             }
+//!             TtsEvent::EndOfStream => break,
+//!             _ => {}
+//!         }
+//!     }
 //!
 //!     client.shutdown().await;
 //!     Ok(())
@@ -30,7 +39,6 @@
 
 mod error;
 mod messages;
-mod queue;
 mod stt;
 pub mod textsim;
 mod tts;
@@ -38,9 +46,8 @@ mod ws;
 
 pub use error::Error;
 pub use messages::*;
-pub use queue::BoundedQueue;
-pub use stt::{SttClient, SttConfig};
-pub use tts::{TtsClient, TtsConfig};
+pub use stt::{SttClient, SttConfig, SttEvent};
+pub use tts::{TtsClient, TtsConfig, TtsEvent};
 
 /// Default TTS WebSocket endpoint.
 pub const TTS_ENDPOINT: &str = "wss://us.api.gradium.ai/api/speech/tts";

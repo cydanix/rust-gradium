@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message;
@@ -10,12 +11,39 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::Error;
 use crate::messages::*;
-use crate::queue::BoundedQueue;
 use crate::ws::WebSocket;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const QUEUE_CAPACITY: usize = 1024;
+
+/// Events emitted by the TTS client.
+#[derive(Debug, Clone)]
+pub enum TtsEvent {
+    /// The TTS client is ready.
+    Ready {
+        /// Request ID for this session.
+        request_id: String,
+    },
+    /// Audio chunk received (base64-encoded PCM).
+    Audio {
+        /// Base64-encoded audio data.
+        audio: String,
+    },
+    /// Text echo from server.
+    TextEcho {
+        /// The text that was sent.
+        text: String,
+    },
+    /// An error occurred.
+    Error {
+        /// Error message.
+        message: String,
+        /// Error code.
+        code: i32,
+    },
+    /// End of stream.
+    EndOfStream,
+}
 
 /// Configuration for the TTS client.
 #[derive(Debug, Clone)]
@@ -49,27 +77,31 @@ impl TtsConfig {
 pub struct TtsClient {
     config: TtsConfig,
     conn: RwLock<Option<Arc<WebSocket>>>,
-    speech_queue: Arc<BoundedQueue<String>>,
     ready: Arc<AtomicBool>,
     error_count: Arc<AtomicU32>,
     stopping: Arc<AtomicBool>,
     read_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
     session_id: String,
+    event_tx: UnboundedSender<TtsEvent>,
 }
 
 impl TtsClient {
     /// Creates a new TTS client with the given configuration.
-    pub fn new(config: TtsConfig) -> Self {
-        Self {
+    ///
+    /// Returns the client and an event receiver for receiving TTS events.
+    pub fn new(config: TtsConfig) -> (Self, UnboundedReceiver<TtsEvent>) {
+        let (event_tx, event_rx) = unbounded_channel();
+        let client = Self {
             config,
             conn: RwLock::new(None),
-            speech_queue: Arc::new(BoundedQueue::new(QUEUE_CAPACITY)),
             ready: Arc::new(AtomicBool::new(false)),
             error_count: Arc::new(AtomicU32::new(0)),
             stopping: Arc::new(AtomicBool::new(false)),
             read_task: RwLock::new(None),
             session_id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
-        }
+            event_tx,
+        };
+        (client, event_rx)
     }
 
     /// Starts the TTS client, connecting to the server and waiting for ready state.
@@ -80,7 +112,6 @@ impl TtsClient {
         self.ready.store(false, Ordering::SeqCst);
         self.error_count.store(0, Ordering::SeqCst);
         self.stopping.store(false, Ordering::SeqCst);
-        self.speech_queue.clear().await;
 
         // Connect
         let conn = WebSocket::connect(&self.config.endpoint, &self.config.api_key).await?;
@@ -92,13 +123,13 @@ impl TtsClient {
 
         // Start read task
         let read_conn = Arc::clone(&conn);
-        let speech_queue = Arc::clone(&self.speech_queue);
         let ready = Arc::clone(&self.ready);
         let error_count = Arc::clone(&self.error_count);
         let session_id = self.session_id.clone();
+        let event_tx = self.event_tx.clone();
 
         *self.read_task.write().await = Some(tokio::spawn(async move {
-            Self::read_messages(read_conn, speech_queue, ready, error_count, session_id).await;
+            Self::read_messages(read_conn, ready, error_count, session_id, event_tx).await;
         }));
 
         // Wait for ready
@@ -145,18 +176,6 @@ impl TtsClient {
             return Err(Error::NotReady);
         }
         self.send_text(text).await
-    }
-
-    /// Retrieves up to `size` audio chunks from the queue.
-    ///
-    /// Returns base64-encoded audio data strings.
-    pub async fn get_speech(&self, size: usize) -> Vec<String> {
-        self.speech_queue.get(size).await
-    }
-
-    /// Returns the number of audio chunks available in the queue.
-    pub async fn get_speech_size(&self) -> usize {
-        self.speech_queue.len().await
     }
 
     /// Returns true if the client is ready and running.
@@ -222,10 +241,10 @@ impl TtsClient {
 
     async fn read_messages(
         conn: Arc<WebSocket>,
-        speech_queue: Arc<BoundedQueue<String>>,
         ready: Arc<AtomicBool>,
         error_count: Arc<AtomicU32>,
         session_id: String,
+        event_tx: UnboundedSender<TtsEvent>,
     ) {
         info!(session_id = %session_id, "TTS reading messages");
 
@@ -240,7 +259,7 @@ impl TtsClient {
 
             let text = match &msg {
                 Message::Text(t) => {
-                    debug!(msg = %t, "TTS received text message");
+                    //debug!(msg = %t, "TTS received text message");
                     t.clone()
                 }
                 Message::Binary(b) => {
@@ -289,10 +308,7 @@ impl TtsClient {
                         }
                     };
                     debug!(audio_len = msg.audio.len(), "TTS audio chunk received");
-                    if let Err(e) = speech_queue.append(vec![msg.audio]).await {
-                        error!(error = %e, "Speech queue append error");
-                        return;
-                    }
+                    let _ = event_tx.send(TtsEvent::Audio { audio: msg.audio });
                 }
                 "ready" => {
                     let msg: TtsReadyMessage = match serde_json::from_str(&text) {
@@ -304,6 +320,9 @@ impl TtsClient {
                     };
                     info!(request_id = %msg.request_id, "TTS ready");
                     ready.store(true, Ordering::SeqCst);
+                    let _ = event_tx.send(TtsEvent::Ready {
+                        request_id: msg.request_id,
+                    });
                 }
                 "text" => {
                     let msg: TtsTextMessage = match serde_json::from_str(&text) {
@@ -314,6 +333,7 @@ impl TtsClient {
                         }
                     };
                     debug!(text = %msg.text, "TTS text echo");
+                    let _ = event_tx.send(TtsEvent::TextEcho { text: msg.text });
                 }
                 "error" => {
                     let msg: ErrorMessage = match serde_json::from_str(&text) {
@@ -325,10 +345,15 @@ impl TtsClient {
                     };
                     error!(message = %msg.message, code = msg.code, "TTS error");
                     error_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = event_tx.send(TtsEvent::Error {
+                        message: msg.message,
+                        code: msg.code,
+                    });
                     return;
                 }
                 "end_of_stream" => {
                     info!("TTS end of stream");
+                    let _ = event_tx.send(TtsEvent::EndOfStream);
                     return;
                 }
                 other => {
@@ -339,4 +364,3 @@ impl TtsClient {
         }
     }
 }
-
