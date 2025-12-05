@@ -18,9 +18,9 @@ serde_json = "1.0"
 tracing = "0.1"
 thiserror = "2.0"
 uuid = { version = "1.0", features = ["v4"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-base64 = "0.22"
 

@@ -15,14 +15,15 @@
 //!         output_format: "pcm".to_string(),
 //!     };
 //!
-//!     let (client, mut events) = TtsClient::new(config);
+//!     let client = TtsClient::new(config);
 //!     client.start().await?;
 //!
 //!     client.process("Hello, world!").await?;
+//!     client.send_eos().await?;
 //!
-//!     // Receive audio chunks via events
-//!     while let Some(event) = events.recv().await {
-//!         match event {
+//!     // Receive audio chunks via next_event
+//!     loop {
+//!         match client.next_event().await? {
 //!             TtsEvent::Audio { audio } => {
 //!                 // Process base64-encoded audio
 //!                 println!("Received audio chunk: {} bytes", audio.len());
@@ -43,7 +44,9 @@ mod stt;
 pub mod textsim;
 mod tts;
 mod ws;
+mod downsample;
 
+pub use downsample::downsample_48_to_24_base64;
 pub use error::Error;
 pub use messages::*;
 pub use stt::{SttClient, SttConfig, SttEvent};

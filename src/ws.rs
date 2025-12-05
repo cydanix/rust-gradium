@@ -132,8 +132,9 @@ impl WebSocket {
                     Some(Ok(Message::Pong(_))) => {
                         debug!("Received pong");
                     }
-                    Some(Ok(Message::Close(_))) => {
+                    Some(Ok(Message::Close(frame))) => {
                         debug!("Received close");
+                        let _ = read_tx.send(Ok(Message::Close(frame))).await;
                         break;
                     }
                     Some(Ok(msg)) => {

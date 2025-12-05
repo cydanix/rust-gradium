@@ -6,7 +6,7 @@ Rust client library for [Gradium AI](https://gradium.ai) Text-to-Speech (TTS) an
 
 - **Text-to-Speech (TTS)**: Stream text to synthesized audio
 - **Speech-to-Text (STT)**: Stream audio for real-time transcription
-- **Event-driven API**: Receive audio/text via async event channels
+- **Event-driven API**: Pull events via `next_event()` async method
 - Async/await with Tokio runtime
 - Automatic WebSocket ping/pong handling
 
@@ -35,20 +35,21 @@ async fn main() -> Result<(), rust_gradium::Error> {
         std::env::var("GRADIUM_API_KEY").expect("GRADIUM_API_KEY not set"),
     );
 
-    let (client, mut events) = TtsClient::new(config);
+    let client = TtsClient::new(config);
     client.start().await?;
 
     // Send text for synthesis
     client.process("Hello, world!").await?;
+    client.send_eos().await?;
 
-    // Receive audio chunks via events
-    while let Some(event) = events.recv().await {
-        match event {
+    // Receive audio chunks via next_event()
+    loop {
+        match client.next_event().await? {
             TtsEvent::Audio { audio } => {
                 // audio is base64-encoded PCM
                 println!("Received audio chunk: {} bytes", audio.len());
             }
-            TtsEvent::EndOfStream => break,
+            TtsEvent::EndOfStream | TtsEvent::Close => break,
             _ => {}
         }
     }
@@ -70,25 +71,32 @@ async fn main() -> Result<(), rust_gradium::Error> {
         std::env::var("GRADIUM_API_KEY").expect("GRADIUM_API_KEY not set"),
     );
 
-    let (client, mut events) = SttClient::new(config);
+    let client = SttClient::new(config);
     client.start().await?;
 
     // Send audio for recognition (base64-encoded PCM)
     let audio_base64 = "..."; // Your base64-encoded audio data
     client.process(audio_base64).await?;
+    client.send_eos().await?;
 
-    // Receive text via events
+    // Receive text via next_event()
     let mut full_text = String::new();
-    while let Some(event) = events.recv().await {
-        match event {
+    loop {
+        match client.next_event().await? {
             SttEvent::Text { text, .. } => {
                 full_text.push_str(&text);
                 println!("Recognized: {}", text);
             }
-            SttEvent::UserInactive { inactivity_prob } => {
-                println!("User inactive (prob: {:.2})", inactivity_prob);
+            SttEvent::Step { vad, .. } => {
+                // VAD entries contain inactivity probabilities at different time horizons
+                for entry in vad {
+                    if entry.inactivity_prob > 0.5 {
+                        println!("User likely inactive (prob: {:.2} at {}s horizon)", 
+                            entry.inactivity_prob, entry.horizon);
+                    }
+                }
             }
-            SttEvent::EndOfStream => break,
+            SttEvent::EndOfStream | SttEvent::Close => break,
             _ => {}
         }
     }
@@ -105,6 +113,7 @@ use rust_gradium::{
     TtsClient, TtsConfig, TtsEvent,
     SttClient, SttConfig, SttEvent,
     TTS_ENDPOINT, STT_ENDPOINT, DEFAULT_VOICE_ID,
+    downsample_48_to_24_base64,
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -114,7 +123,7 @@ async fn main() -> Result<(), rust_gradium::Error> {
     let api_key = std::env::var("GRADIUM_API_KEY").expect("GRADIUM_API_KEY not set");
 
     // Initialize TTS
-    let (tts, mut tts_events) = TtsClient::new(TtsConfig::new(
+    let tts = TtsClient::new(TtsConfig::new(
         TTS_ENDPOINT.to_string(),
         DEFAULT_VOICE_ID.to_string(),
         api_key.clone(),
@@ -122,52 +131,59 @@ async fn main() -> Result<(), rust_gradium::Error> {
     tts.start().await?;
 
     // Initialize STT
-    let (stt, mut stt_events) = SttClient::new(SttConfig::new(
+    let stt = SttClient::new(SttConfig::new(
         STT_ENDPOINT.to_string(),
         api_key,
     ));
     stt.start().await?;
 
+    let tts = Arc::new(tts);
     let stt = Arc::new(stt);
     let full_text = Arc::new(Mutex::new(String::new()));
 
     // Task: Forward TTS audio to STT
+    let tts_clone = Arc::clone(&tts);
     let stt_clone = Arc::clone(&stt);
     let audio_task = tokio::spawn(async move {
-        while let Some(event) = tts_events.recv().await {
-            match event {
-                TtsEvent::Audio { audio } => {
-                    // In production, downsample 48kHz -> 24kHz if needed
-                    let _ = stt_clone.process(&audio).await;
+        loop {
+            match tts_clone.next_event().await {
+                Ok(TtsEvent::Audio { audio }) => {
+                    // Downsample 48kHz -> 24kHz for STT
+                    let downsampled = downsample_48_to_24_base64(&audio);
+                    let _ = stt_clone.process(&downsampled).await;
                 }
-                TtsEvent::EndOfStream => break,
+                Ok(TtsEvent::EndOfStream) | Ok(TtsEvent::Close) => break,
+                Err(_) => break,
                 _ => {}
             }
         }
+        tts_clone.shutdown().await;
     });
 
     // Task: Collect STT text
+    let stt_clone2 = Arc::clone(&stt);
     let full_text_clone = Arc::clone(&full_text);
     let text_task = tokio::spawn(async move {
-        while let Some(event) = stt_events.recv().await {
-            match event {
-                SttEvent::Text { text, .. } => {
+        loop {
+            match stt_clone2.next_event().await {
+                Ok(SttEvent::Text { text, .. }) => {
                     full_text_clone.lock().await.push_str(&text);
                 }
-                SttEvent::EndOfStream => break,
+                Ok(SttEvent::EndOfStream) | Ok(SttEvent::Close) => break,
+                Err(_) => break,
                 _ => {}
             }
         }
+        stt_clone2.shutdown().await;
     });
 
     // Generate speech
     tts.process("Hello, how are you?").await?;
-
-    // Shutdown (triggers EndOfStream events)
-    tts.shutdown().await;
+    tts.send_eos().await?;
     let _ = audio_task.await;
 
-    stt.shutdown().await;
+    // Signal STT end of stream
+    stt.send_eos().await?;
     let _ = text_task.await;
 
     println!("Round-trip result: {}", full_text.lock().await);
@@ -210,10 +226,14 @@ let config = SttConfig {
 
 | Method | Description |
 |--------|-------------|
-| `new(config) -> (Self, Receiver)` | Create a new TTS client and event receiver |
+| `new(config) -> Self` | Create a new TTS client |
 | `start().await` | Connect and initialize the session |
 | `process(text).await` | Send text for synthesis |
+| `send_eos().await` | Signal end of input stream |
+| `next_event().await` | Receive the next event |
+| `is_ready()` | Check if client is ready |
 | `is_running()` | Check if client is ready and running |
+| `error_count()` | Get the current error count |
 | `shutdown().await` | Close the connection |
 
 ### TtsEvent
@@ -221,19 +241,26 @@ let config = SttConfig {
 | Variant | Description |
 |---------|-------------|
 | `Ready { request_id }` | Client is ready |
-| `Audio { audio }` | Base64-encoded PCM audio chunk |
+| `Audio { audio }` | Base64-encoded PCM audio chunk (48kHz) |
 | `TextEcho { text }` | Echo of sent text |
 | `Error { message, code }` | Error occurred |
 | `EndOfStream` | Stream ended |
+| `Close` | WebSocket connection closed |
+| `Ping` | Ping received |
+| `Pong` | Pong received |
 
 ### SttClient
 
 | Method | Description |
 |--------|-------------|
-| `new(config) -> (Self, Receiver)` | Create a new STT client and event receiver |
+| `new(config) -> Self` | Create a new STT client |
 | `start().await` | Connect and initialize the session |
-| `process(audio).await` | Send base64-encoded audio for recognition |
+| `process(audio).await` | Send base64-encoded audio for recognition (24kHz PCM) |
+| `send_eos().await` | Signal end of input stream |
+| `next_event().await` | Receive the next event |
+| `is_ready()` | Check if client is ready |
 | `is_running()` | Check if client is ready and running |
+| `error_count()` | Get the current error count |
 | `shutdown().await` | Close the connection |
 
 ### SttEvent
@@ -243,9 +270,25 @@ let config = SttConfig {
 | `Ready { request_id, model_name, sample_rate }` | Client is ready |
 | `Text { text, start }` | Recognized text with timestamp |
 | `EndText { stop }` | End of phrase |
-| `UserInactive { inactivity_prob }` | User is inactive (prob > 0.5) |
+| `Step { step_idx, step_duration, vad, total_duration }` | Processing step with VAD entries |
 | `Error { message, code }` | Error occurred |
 | `EndOfStream` | Stream ended |
+| `Close` | WebSocket connection closed |
+| `Ping` | Ping received |
+| `Pong` | Pong received |
+
+### VadEntry
+
+| Field | Description |
+|-------|-------------|
+| `horizon` | Time horizon in seconds |
+| `inactivity_prob` | Probability user is inactive (0.0 - 1.0) |
+
+### Utility Functions
+
+| Function | Description |
+|----------|-------------|
+| `downsample_48_to_24_base64(input)` | Downsample base64 audio from 48kHz to 24kHz |
 
 ## Testing
 

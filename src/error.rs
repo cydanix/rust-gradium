@@ -46,6 +46,36 @@ pub enum Error {
     #[error("Unknown message type: {0}")]
     UnknownMessageType(String),
 
+    /// TTS error from server.
+    #[error("TTS error: {message} (code: {code})")]
+    TtsError {
+        /// Error message.
+        message: String,
+        /// Error code.
+        code: i32,
+    },
+
+    /// STT error from server.
+    #[error("STT error: {message} (code: {code})")]
+    SttError {
+        /// Error message.
+        message: String,
+        /// Error code.
+        code: i32,
+    },
+
+    /// Invalid UTF-8 in message.
+    #[error("Invalid UTF-8")]
+    InvalidUtf8,
+
+    /// WebSocket connection closed.
+    #[error("WebSocket closed")]
+    WebSocketClose,
+
+    /// Invalid JSON in message.
+    #[error("Invalid JSON")]
+    InvalidJson,
+
     /// Channel send error.
     #[error("Channel send error")]
     ChannelSend,
@@ -53,5 +83,9 @@ pub enum Error {
     /// Channel receive error.
     #[error("Channel receive error")]
     ChannelRecv,
+
+    /// Unexpected event type received.
+    #[error("Unexpected event type")]
+    UnexpectedEventType,
 }
 

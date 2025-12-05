@@ -2,19 +2,14 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
-use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::error::Error;
 use crate::messages::*;
 use crate::ws::WebSocket;
 
-const READY_TIMEOUT: Duration = Duration::from_secs(30);
-const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Events emitted by the STT client.
 #[derive(Debug, Clone)]
@@ -28,10 +23,16 @@ pub enum SttEvent {
         /// Expected sample rate.
         sample_rate: i32,
     },
-    /// User is inactive (no speech detected).
-    UserInactive {
-        /// Inactivity probability (0.0 - 1.0).
-        inactivity_prob: f32,
+    /// A step of the STT process.
+    Step {
+        /// Step index.
+        step_idx: i32,
+        /// Step duration in seconds.
+        step_duration: f32,
+        /// VAD entries.
+        vad: Vec<VadEntry>,
+        /// Total duration in seconds.
+        total_duration: f32,
     },
     /// A word/text was recognized.
     Text {
@@ -54,6 +55,11 @@ pub enum SttEvent {
     },
     /// End of stream.
     EndOfStream,
+
+    Ping,
+    Pong,
+    Close,
+    Frame,
 }
 
 /// Configuration for the STT client.
@@ -88,28 +94,23 @@ pub struct SttClient {
     ready: Arc<AtomicBool>,
     error_count: Arc<AtomicU32>,
     stopping: Arc<AtomicBool>,
-    read_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
     session_id: String,
-    event_tx: UnboundedSender<SttEvent>,
 }
 
 impl SttClient {
     /// Creates a new STT client with the given configuration.
     ///
     /// Returns the client and an event receiver for receiving STT events.
-    pub fn new(config: SttConfig) -> (Self, UnboundedReceiver<SttEvent>) {
-        let (event_tx, event_rx) = unbounded_channel();
+    pub fn new(config: SttConfig) -> Self {
         let client = Self {
             config,
             conn: RwLock::new(None),
             ready: Arc::new(AtomicBool::new(false)),
             error_count: Arc::new(AtomicU32::new(0)),
             stopping: Arc::new(AtomicBool::new(false)),
-            read_task: RwLock::new(None),
             session_id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
-            event_tx,
         };
-        (client, event_rx)
+        client
     }
 
     /// Starts the STT client, connecting to the server and waiting for ready state.
@@ -129,22 +130,26 @@ impl SttClient {
         // Send setup
         self.send_setup().await?;
 
-        // Start read task
-        let read_conn = Arc::clone(&conn);
-        let ready = Arc::clone(&self.ready);
-        let error_count = Arc::clone(&self.error_count);
-        let session_id = self.session_id.clone();
-        let event_tx = self.event_tx.clone();
 
-        *self.read_task.write().await = Some(tokio::spawn(async move {
-            Self::read_messages(read_conn, ready, error_count, session_id, event_tx).await;
-        }));
-
-        // Wait for ready
-        if !self.wait_ready().await {
-            self.shutdown().await;
-            return Err(Error::ReadyTimeout);
+        loop {
+            let event = self.next_event().await?;
+            match event {
+                SttEvent::Ready { request_id, model_name, sample_rate } => {
+                    info!(request_id = %request_id, model_name = %model_name, sample_rate = sample_rate, "STT ready");
+                    self.ready.store(true, Ordering::SeqCst);
+                    break;
+                }
+                SttEvent::Error { message, code } => {
+                    error!(message = %message, code = code, "STT error");
+                    self.error_count.fetch_add(1, Ordering::SeqCst);
+                    return Err(Error::ServerError { message, code });
+                }
+                _ => {
+                    return Err(Error::UnexpectedEventType);
+                }
+            }
         }
+
 
         info!(session_id = %self.session_id, "STT started");
         Ok(())
@@ -154,19 +159,7 @@ impl SttClient {
     ///
     /// Sends end_of_stream, waits for all text to be received, then closes the connection.
     pub async fn shutdown(&self) {
-        self.stopping.store(true, Ordering::SeqCst);
-
         info!(session_id = %self.session_id, "STT shutting down");
-
-        // Send EOS - this triggers the server to send remaining text and then end_of_stream
-        if let Err(e) = self.send_eos().await {
-            warn!(error = %e, "Failed to send EOS");
-        }
-
-        // Wait for read task to complete (will return when server sends end_of_stream)
-        if let Some(task) = self.read_task.write().await.take() {
-            let _ = task.await;
-        }
 
         // Close connection
         if let Some(conn) = self.conn.write().await.take() {
@@ -204,21 +197,6 @@ impl SttClient {
         self.error_count.load(Ordering::SeqCst)
     }
 
-    async fn wait_ready(&self) -> bool {
-        let start = std::time::Instant::now();
-        while start.elapsed() < READY_TIMEOUT && !self.ready.load(Ordering::SeqCst) {
-            debug!("Waiting for STT ready");
-            if self.error_count.load(Ordering::SeqCst) > 0 {
-                break;
-            }
-            sleep(READY_POLL_INTERVAL).await;
-        }
-        let is_ready =
-            self.ready.load(Ordering::SeqCst) && self.error_count.load(Ordering::SeqCst) == 0;
-        debug!(ready = is_ready, "STT ready check complete");
-        is_ready
-    }
-
     async fn send_setup(&self) -> Result<(), Error> {
         info!("Sending STT setup");
         let payload = SttSetupMessage::new(
@@ -236,8 +214,10 @@ impl SttClient {
         self.conn.read().await.as_ref().unwrap().send_text(&json).await
     }
 
-    async fn send_eos(&self) -> Result<(), Error> {
+    pub async fn send_eos(&self) -> Result<(), Error> {
         debug!("Sending STT EOS");
+        self.stopping.store(true, Ordering::SeqCst);
+
         let payload = EosMessage::new();
         let json = serde_json::to_string(&payload)?;
         if let Some(conn) = self.conn.read().await.as_ref() {
@@ -247,136 +227,136 @@ impl SttClient {
         }
     }
 
-    async fn read_messages(
-        conn: Arc<WebSocket>,
-        ready: Arc<AtomicBool>,
-        error_count: Arc<AtomicU32>,
-        session_id: String,
-        event_tx: UnboundedSender<SttEvent>,
-    ) {
-        info!(session_id = %session_id, "STT reading messages");
-
-        loop {
-            let msg = match conn.recv().await {
-                Ok(msg) => msg,
+    pub async fn next_event(&self) -> Result<SttEvent, Error> {
+        let msg = match self.conn.read().await.as_ref().unwrap().recv().await {
+            Ok(msg) => msg,
+            Err(e) => return Err(e),
+        };
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Binary(b) => match String::from_utf8(b) {
+                Ok(s) => s,
                 Err(e) => {
-                    error!(error = %e, "STT read error");
-                    return;
+                    error!(error = %e, "Invalid UTF-8 in binary message");
+                    return Err(Error::InvalidUtf8);
                 }
-            };
+            },
+            Message::Ping(_) => {
+                debug!("STT received ping");
+                return Ok(SttEvent::Ping);
+            }
+            Message::Pong(_) => {
+                debug!("STT received pong");
+                return Ok(SttEvent::Pong);
+            }
+            Message::Close(frame) => {
+                debug!(frame = ?frame, "STT received close");
+                return Ok(SttEvent::Close);
+            }
+            Message::Frame(_) => {
+                debug!("STT received raw frame");
+                return Ok(SttEvent::Frame);
+            }
+        };
 
-            let text = match msg {
-                Message::Text(t) => t,
-                Message::Binary(b) => match String::from_utf8(b) {
-                    Ok(s) => s,
+        let generic: GenericMessage = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                error!(error = %e, "Failed to parse message");
+                return Err(Error::InvalidJson);
+            }
+        };
+
+        match generic.msg_type.as_str() {
+            "ready" => {
+                let msg: SttReadyMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
                     Err(e) => {
-                        error!(error = %e, "Invalid UTF-8 in binary message");
-                        continue;
+                        error!(error = %e, "Failed to parse ready message");
+                        return Err(Error::InvalidJson);
                     }
-                },
-                Message::Close(_) => return,
-                _ => continue,
-            };
-
-            let generic: GenericMessage = match serde_json::from_str(&text) {
-                Ok(m) => m,
-                Err(e) => {
-                    error!(error = %e, "Failed to parse message");
-                    return;
-                }
-            };
-
-            match generic.msg_type.as_str() {
-                "ready" => {
-                    let msg: SttReadyMessage = match serde_json::from_str(&text) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            error!(error = %e, "Failed to parse ready message");
-                            return;
-                        }
-                    };
-                    info!(
-                        request_id = %msg.request_id,
-                        model_name = %msg.model_name,
-                        sample_rate = msg.sample_rate,
-                        "STT ready"
-                    );
-                    ready.store(true, Ordering::SeqCst);
-                    let _ = event_tx.send(SttEvent::Ready {
-                        request_id: msg.request_id,
-                        model_name: msg.model_name,
-                        sample_rate: msg.sample_rate,
-                    });
-                }
-                "text" => {
-                    let msg: SttTextMessage = match serde_json::from_str(&text) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            error!(error = %e, "Failed to parse text message");
-                            return;
-                        }
-                    };
-                    debug!(text = %msg.text, start = msg.start, "STT word");
-                    let _ = event_tx.send(SttEvent::Text {
-                        text: msg.text,
-                        start: msg.start,
-                    });
-                }
-                "end_text" => {
-                    let msg: SttEndTextMessage = match serde_json::from_str(&text) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            error!(error = %e, "Failed to parse end_text message");
-                            return;
-                        }
-                    };
-                    debug!(stop = msg.stop, "STT end text");
-                    let _ = event_tx.send(SttEvent::EndText { stop: msg.stop });
-                }
-                "step" => {
-                    // Step messages with VAD info
-                    let msg: SttStepMessage = match serde_json::from_str(&text) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            error!(error = %e, "Failed to parse step message");
-                            return;
-                        }
-                    };
-
-                    if msg.vad.len() > 2 && msg.vad[2].inactivity_prob > 0.5 {
-                        info!(session_id = %session_id, inactivity_prob = msg.vad[2].inactivity_prob, "User is inactive");
-                        let _ = event_tx.send(SttEvent::UserInactive {
-                            inactivity_prob: msg.vad[2].inactivity_prob,
-                        });
+                };
+                info!(
+                    request_id = %msg.request_id,
+                    model_name = %msg.model_name,
+                    sample_rate = msg.sample_rate,
+                    "STT ready"
+                );
+                self.ready.store(true, Ordering::SeqCst);
+                Ok(SttEvent::Ready {
+                    request_id: msg.request_id,
+                    model_name: msg.model_name,
+                    sample_rate: msg.sample_rate,
+                })
+            }
+            "text" => {
+                let msg: SttTextMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!(error = %e, "Failed to parse text message");
+                        return Err(Error::InvalidJson);
                     }
-                }
-                "error" => {
-                    let msg: ErrorMessage = match serde_json::from_str(&text) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            error!(error = %e, "Failed to parse error message");
-                            return;
-                        }
-                    };
-                    error!(message = %msg.message, code = msg.code, "STT error");
-                    error_count.fetch_add(1, Ordering::SeqCst);
-                    let _ = event_tx.send(SttEvent::Error {
-                        message: msg.message,
-                        code: msg.code,
-                    });
-                    return;
-                }
-                "end_of_stream" => {
-                    info!("STT end of stream");
-                    let _ = event_tx.send(SttEvent::EndOfStream);
-                    return;
-                }
-                other => {
-                    error!(msg_type = %other, "Unknown STT message type");
-                    return;
-                }
+                };
+                debug!(text = %msg.text, start = msg.start, "STT word");
+                Ok(SttEvent::Text {
+                    text: msg.text,
+                    start: msg.start,
+                })
+            }
+            "end_text" => {
+                let msg: SttEndTextMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!(error = %e, "Failed to parse end_text message");
+                        return Err(Error::InvalidJson);
+                    }
+                };
+                debug!(stop = msg.stop, "STT end text");
+                Ok(SttEvent::EndText { stop: msg.stop })
+            }
+            "step" => {
+                // Step messages with VAD info
+                let msg: SttStepMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!(error = %e, "Failed to parse step message");
+                        return Err(Error::InvalidJson);
+                    }
+                };
+
+                Ok(SttEvent::Step {
+                    step_idx: msg.step_idx,
+                    step_duration: msg.step_duration,
+                    vad: msg.vad,
+                    total_duration: msg.total_duration,
+                })
+            }
+            "error" => {
+                let msg: ErrorMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!(error = %e, "Failed to parse error message");
+                        return Err(Error::InvalidJson);
+                    }
+                };
+                error!(message = %msg.message, code = msg.code, "STT error");
+                self.error_count.fetch_add(1, Ordering::SeqCst);
+                Ok(SttEvent::Error {
+                    message: msg.message,
+                    code: msg.code,
+                })
+            }
+            "end_of_stream" => {
+                info!("STT end of stream");
+                Ok(SttEvent::EndOfStream)
+            }
+            other => {
+                error!(msg_type = %other, "Unknown STT message type");
+                return Err(Error::UnknownMessageType(other.to_string()));
             }
         }
+
     }
+
 }
 
