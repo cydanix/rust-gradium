@@ -10,6 +10,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::error::Error;
+use crate::wg::WaitGroup;
 
 const CONN_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -24,6 +25,7 @@ pub struct WebSocket {
     _ping_handle: tokio::task::JoinHandle<()>,
     _read_handle: tokio::task::JoinHandle<()>,
     _write_handle: tokio::task::JoinHandle<()>,
+    wg: WaitGroup,
 }
 
 impl WebSocket {
@@ -65,10 +67,14 @@ impl WebSocket {
 
         let stop_notify = Arc::new(Notify::new());
 
+        let wg = WaitGroup::new();
+
         // Write task
         let write_clone = Arc::clone(&write);
         let stop_notify_clone = Arc::clone(&stop_notify);
+        let wg_guard_write = wg.add();
         let write_handle = tokio::spawn(async move {
+            let _wg_guard = wg_guard_write;
             loop {
                 tokio::select! {
                     _ = stop_notify_clone.notified() => {
@@ -78,6 +84,7 @@ impl WebSocket {
                     msg = write_rx.recv() => {
                         match msg {
                             Some(msg) => {
+                                let is_close = matches!(&msg, Message::Close(_));
                                 let msg_desc = match &msg {
                                     Message::Text(t) => format!("Text({})", t.len()),
                                     Message::Binary(b) => format!("Binary({})", b.len()),
@@ -90,6 +97,10 @@ impl WebSocket {
                                 match writer.send(msg).await {
                                     Ok(_) => {
                                         debug!(msg = %msg_desc, "WebSocket message sent");
+                                        if is_close {
+                                            debug!("Write task stopping after Close");
+                                            break;
+                                        }
                                     }
                                     Err(e) => {
                                         error!(error = %e, "Write error");
@@ -111,7 +122,9 @@ impl WebSocket {
         let read_clone = Arc::clone(&read);
         let stop_notify_clone = Arc::clone(&stop_notify);
         let write_tx_clone = write_tx.clone();
+        let wg_guard_read = wg.add();
         let read_handle = tokio::spawn(async move {
+            let _wg_guard = wg_guard_read;
             loop {
                 let msg = {
                     let mut reader = read_clone.lock().await;
@@ -159,7 +172,9 @@ impl WebSocket {
         // Ping task
         let write_tx_clone = write_tx.clone();
         let stop_notify_clone = Arc::clone(&stop_notify);
+        let wg_guard_ping = wg.add();
         let ping_handle = tokio::spawn(async move {
+            let _wg_guard = wg_guard_ping;
             let mut ping_interval = interval(PING_INTERVAL);
             ping_interval.tick().await; // Skip immediate tick
 
@@ -187,6 +202,7 @@ impl WebSocket {
             _ping_handle: ping_handle,
             _read_handle: read_handle,
             _write_handle: write_handle,
+            wg: wg,
         })
     }
 
@@ -225,6 +241,8 @@ impl WebSocket {
             .send(Message::Close(None))
             .await;
         info!("WebSocket closed");
+        self.wg.wait().await;
+        info!("WebSocket wait group completed");
         Ok(())
     }
 }

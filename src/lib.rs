@@ -43,11 +43,13 @@ mod messages;
 mod stt;
 pub mod textsim;
 mod tts;
+pub mod wg;
 mod ws;
 mod downsample;
 
 pub use downsample::downsample_48_to_24_base64;
 pub use error::Error;
+pub use wg::{WaitGroup, WaitGroupGuard};
 pub use messages::*;
 pub use stt::{SttClient, SttConfig, SttEvent};
 pub use tts::{TtsClient, TtsConfig, TtsEvent};

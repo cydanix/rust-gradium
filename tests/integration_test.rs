@@ -3,6 +3,7 @@
 //! To run these tests, set the GRADIUM_API_KEY environment variable.
 
 use rust_gradium::{downsample_48_to_24_base64, SttClient, SttConfig, SttEvent, TtsClient, TtsConfig, TtsEvent, DEFAULT_VOICE_ID, STT_ENDPOINT, TTS_ENDPOINT};
+use rust_gradium::wg::WaitGroup;
 use tracing::{info, error};
 
 fn get_api_key() -> Option<String> {
@@ -199,10 +200,13 @@ async fn test_tts_stt_round_trip() {
     let stt = Arc::new(stt);
     let tts = Arc::new(tts);
 
+    let wg = WaitGroup::new();
     // Spawn audio forwarding task: TTS events -> STT (must run concurrently!)
     let stt_clone = Arc::clone(&stt);
     let tts_clone = Arc::clone(&tts);
+    let wg_guard_audio = wg.add();
     let audio_task = tokio::spawn(async move {
+        let _wg_guard = wg_guard_audio;
         loop {
             let event = match tts_clone.next_event().await {
                 Ok(e) => e,
@@ -240,7 +244,9 @@ async fn test_tts_stt_round_trip() {
     // Spawn text collection task: STT events -> full_text (must run concurrently!)
     let full_text_clone = Arc::clone(&full_text);
     let stt_clone2 = Arc::clone(&stt);
+    let wg_guard_text = wg.add();
     let text_task = tokio::spawn(async move {
+        let _wg_guard = wg_guard_text;
         loop {
             let event = match stt_clone2.next_event().await {
                 Ok(e) => e,
@@ -287,6 +293,8 @@ async fn test_tts_stt_round_trip() {
     // Shutdown STT (sends EOS, triggers EndOfStream event)
     stt.send_eos().await.expect("Failed to send EOS");
     let _ = text_task.await;
+
+    wg.wait().await;
 
     // Compare results
     let full_text_result = full_text.lock().await.clone();
