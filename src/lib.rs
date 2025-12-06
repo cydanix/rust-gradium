@@ -47,7 +47,7 @@ pub mod wg;
 mod ws;
 mod downsample;
 
-pub use downsample::downsample_48_to_24_base64;
+pub use downsample::{downsample_48_to_24, downsample_48_to_24_base64};
 pub use error::Error;
 pub use wg::{WaitGroup, WaitGroupGuard};
 pub use messages::*;
