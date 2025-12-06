@@ -211,6 +211,15 @@ impl TtsClient {
         }
     }
 
+    /// Sends a ping message to keep the connection alive.
+    pub async fn send_ping(&self) -> Result<(), Error> {
+        if let Some(conn) = self.conn.read().await.as_ref() {
+            conn.send_ping().await
+        } else {
+            Ok(())
+        }
+    }
+
     pub async fn next_event(&self) -> Result<TtsEvent, Error> {
         let msg = match self.conn.read().await.as_ref().unwrap().recv().await {
             Ok(msg) => msg,
@@ -232,8 +241,11 @@ impl TtsClient {
                     }
                 }
             }
-            Message::Ping(_) => {
-                debug!("TTS received ping");
+            Message::Ping(data) => {
+                debug!("TTS received ping, sending pong");
+                if let Some(conn) = self.conn.read().await.as_ref() {
+                    let _ = conn.send_pong(data.clone()).await;
+                }
                 return Ok(TtsEvent::Ping);
             }
             Message::Pong(_) => {

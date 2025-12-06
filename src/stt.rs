@@ -227,6 +227,15 @@ impl SttClient {
         }
     }
 
+    /// Sends a ping message to keep the connection alive.
+    pub async fn send_ping(&self) -> Result<(), Error> {
+        if let Some(conn) = self.conn.read().await.as_ref() {
+            conn.send_ping().await
+        } else {
+            Ok(())
+        }
+    }
+
     pub async fn next_event(&self) -> Result<SttEvent, Error> {
         let msg = match self.conn.read().await.as_ref().unwrap().recv().await {
             Ok(msg) => msg,
@@ -241,8 +250,11 @@ impl SttClient {
                     return Err(Error::InvalidUtf8);
                 }
             },
-            Message::Ping(_) => {
-                debug!("STT received ping");
+            Message::Ping(data) => {
+                debug!("STT received ping, sending pong");
+                if let Some(conn) = self.conn.read().await.as_ref() {
+                    let _ = conn.send_pong(data.clone()).await;
+                }
                 return Ok(SttEvent::Ping);
             }
             Message::Pong(_) => {

@@ -201,6 +201,39 @@ async fn test_tts_stt_round_trip() {
     let tts = Arc::new(tts);
 
     let wg = WaitGroup::new();
+
+    // Spawn TTS ping task
+    let tts_ping = Arc::clone(&tts);
+    let wg_guard_tts_ping = wg.add();
+    let tts_ping_task = tokio::spawn(async move {
+        let _wg_guard = wg_guard_tts_ping;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.tick().await; // Skip immediate tick
+        loop {
+            interval.tick().await;
+            if let Err(e) = tts_ping.send_ping().await {
+                info!("TTS ping stopped: {}", e);
+                break;
+            }
+        }
+    });
+
+    // Spawn STT ping task
+    let stt_ping = Arc::clone(&stt);
+    let wg_guard_stt_ping = wg.add();
+    let stt_ping_task = tokio::spawn(async move {
+        let _wg_guard = wg_guard_stt_ping;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.tick().await; // Skip immediate tick
+        loop {
+            interval.tick().await;
+            if let Err(e) = stt_ping.send_ping().await {
+                info!("STT ping stopped: {}", e);
+                break;
+            }
+        }
+    });
+
     // Spawn audio forwarding task: TTS events -> STT (must run concurrently!)
     let stt_clone = Arc::clone(&stt);
     let tts_clone = Arc::clone(&tts);
@@ -293,6 +326,10 @@ async fn test_tts_stt_round_trip() {
     // Shutdown STT (sends EOS, triggers EndOfStream event)
     stt.send_eos().await.expect("Failed to send EOS");
     let _ = text_task.await;
+
+    // Stop ping tasks
+    tts_ping_task.abort();
+    stt_ping_task.abort();
 
     wg.wait().await;
 
