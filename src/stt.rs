@@ -73,7 +73,6 @@ pub struct SttConfig {
     pub model_name: String,
     /// Input format (default: "pcm").
     pub input_format: String,
-
     /// Language to use for recognition.
     /// Defaults to "en".
     pub language: String,
@@ -81,13 +80,13 @@ pub struct SttConfig {
 
 impl SttConfig {
     /// Creates a new STT configuration with default model and format.
-    pub fn new(endpoint: String, api_key: String) -> Self {
+    pub fn new(endpoint: String, api_key: String, language: String) -> Self {
         Self {
             endpoint,
             api_key,
             model_name: "default".to_string(),
             input_format: "pcm".to_string(),
-            language: "en".to_string(),
+            language: language,
         }
     }
 }

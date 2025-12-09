@@ -135,7 +135,7 @@ async fn test_stt_connection() {
         .try_init()
         .ok();
 
-    let config = SttConfig::new(STT_ENDPOINT.to_string(), api_key);
+    let config = SttConfig::new(STT_ENDPOINT.to_string(), api_key, "en".to_string());
 
     let client = SttClient::new(config);
 
@@ -192,7 +192,7 @@ async fn test_tts_stt_round_trip() {
     tts.start().await.expect("Failed to start TTS");
 
     // Start STT
-    let stt_config = SttConfig::new(STT_ENDPOINT.to_string(), api_key);
+    let stt_config = SttConfig::new(STT_ENDPOINT.to_string(), api_key, "en".to_string());
     let stt = SttClient::new(stt_config);
     stt.start().await.expect("Failed to start STT");
 
