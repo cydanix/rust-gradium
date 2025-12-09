@@ -124,6 +124,14 @@ pub struct TtsAudioMessage {
 // ============================================================================
 
 /// STT setup message sent to initialize the STT session.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SttJsonConfig {
+    /// Language to use for recognition.
+    /// Defaults to "en".
+    pub language: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SttSetupMessage {
     /// The message type (always "setup").
@@ -133,15 +141,18 @@ pub struct SttSetupMessage {
     pub model_name: String,
     /// Input audio format.
     pub input_format: String,
+    /// Extra JSON configuration.
+    pub json_config: SttJsonConfig,
 }
 
 impl SttSetupMessage {
     /// Creates a new STT setup message.
-    pub fn new(model_name: String, input_format: String) -> Self {
+    pub fn new(model_name: String, input_format: String, language: String) -> Self {
         Self {
             msg_type: "setup".to_string(),
             model_name,
             input_format,
+            json_config: SttJsonConfig { language: language },
         }
     }
 }

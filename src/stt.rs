@@ -73,6 +73,10 @@ pub struct SttConfig {
     pub model_name: String,
     /// Input format (default: "pcm").
     pub input_format: String,
+
+    /// Language to use for recognition.
+    /// Defaults to "en".
+    pub language: String,
 }
 
 impl SttConfig {
@@ -83,6 +87,7 @@ impl SttConfig {
             api_key,
             model_name: "default".to_string(),
             input_format: "pcm".to_string(),
+            language: "en".to_string(),
         }
     }
 }
@@ -202,6 +207,7 @@ impl SttClient {
         let payload = SttSetupMessage::new(
             self.config.model_name.clone(),
             self.config.input_format.clone(),
+            self.config.language.clone(),
         );
         let json = serde_json::to_string(&payload)?;
         self.conn.read().await.as_ref().unwrap().send_text(&json).await
