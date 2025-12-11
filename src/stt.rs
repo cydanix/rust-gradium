@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info};
+use base64::Engine;
 
 use crate::error::Error;
 use crate::messages::*;
@@ -98,6 +99,7 @@ pub struct SttSettings {
     sample_rate: usize,
     frame_size: usize,
     delay_in_frames: usize,
+    silence_str: String,
 }
 
 /// Speech-to-Text client for streaming audio recognition.
@@ -128,6 +130,7 @@ impl SttClient {
                 sample_rate: 0,
                 frame_size: 0,
                 delay_in_frames: 0,
+                silence_str: "".to_string(),
             }),
         };
         client
@@ -165,6 +168,7 @@ impl SttClient {
                         sample_rate: sample_rate as usize,
                         frame_size: frame_size as usize,
                         delay_in_frames: delay_in_frames as usize,
+                        silence_str: base64::engine::general_purpose::STANDARD.encode(vec![0; frame_size * delay_in_frames]),
                     };
                     self.ready.store(true, Ordering::SeqCst);
                     break;
@@ -239,21 +243,15 @@ impl SttClient {
     }
 
     async fn send_audio(&self, audio: &str) -> Result<(), Error> {
-        debug!("Sending STT audio");
+        debug!("Sending STT audio length: {}", audio.len());
         let payload = SttAudioMessage::new(audio.to_string());
         let json = serde_json::to_string(&payload)?;
         self.conn.read().await.as_ref().unwrap().send_text(&json).await
     }
 
     pub async fn send_silence(&self) -> Result<(), Error> {
-        let silence_samples = {
-            let settings = self.settings.read().await;
-            settings.delay_in_frames * settings.frame_size
-        };
-        debug!("Sending STT silence with {} samples", silence_samples);
-        let silence_bytes = vec![0; silence_samples];
-        let audio = base64::encode(silence_bytes);
-        self.send_audio(&audio).await?;
+        let settings = self.settings.read().await;
+        self.send_audio(&settings.silence_str).await?;
         Ok(())
     }
 
