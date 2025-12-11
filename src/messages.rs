@@ -168,7 +168,14 @@ pub struct SttReadyMessage {
     /// Model name being used.
     pub model_name: String,
     /// Expected sample rate.
-    pub sample_rate: i32,
+    pub sample_rate: usize,
+
+    pub frame_size: usize,
+
+    #[serde(rename = "delay_in_tokens")]
+    pub delay_in_frames: usize,
+
+    pub text_stream_names: Vec<String>,
 }
 
 /// STT audio message to send audio for recognition.

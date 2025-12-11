@@ -144,6 +144,7 @@ async fn test_stt_connection() {
     assert!(client.is_ready(), "STT client should be ready");
     assert!(client.is_running(), "STT client should be running");
 
+    client.send_silence().await.expect("Failed to send silence");
     client.send_eos().await.expect("Failed to send EOS");
     loop {
         let event = client.next_event().await.expect("Failed to get next event");
@@ -364,4 +365,186 @@ async fn test_tts_stt_round_trip() {
         "Similarity too low: {:.3} (expected >= 0.95)",
         scores.similarity
     );
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_stt_vad() {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let api_key = match get_api_key() {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping test: GRADIUM_API_KEY not set");
+            return;
+        }
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init()
+        .ok();
+
+    // Start TTS
+    let tts_config = TtsConfig::new(
+        TTS_ENDPOINT.to_string(),
+        DEFAULT_VOICE_ID.to_string(),
+        api_key.clone(),
+    );
+    let tts = TtsClient::new(tts_config);
+    tts.start().await.expect("Failed to start TTS");
+
+    // Start STT
+    let stt_config = SttConfig::new(STT_ENDPOINT.to_string(), api_key, "en".to_string());
+    let stt = SttClient::new(stt_config);
+    stt.start().await.expect("Failed to start STT");
+
+    let full_text = Arc::new(Mutex::new(String::new()));
+    let stt = Arc::new(stt);
+    let tts = Arc::new(tts);
+
+    let wg = WaitGroup::new();
+
+    // Spawn TTS ping task
+    let tts_ping = Arc::clone(&tts);
+    let wg_guard_tts_ping = wg.add();
+    let tts_ping_task = tokio::spawn(async move {
+        let _wg_guard = wg_guard_tts_ping;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.tick().await; // Skip immediate tick
+        loop {
+            interval.tick().await;
+            if let Err(e) = tts_ping.send_ping().await {
+                info!("TTS ping stopped: {}", e);
+                break;
+            }
+        }
+    });
+
+    // Spawn STT ping task
+    let stt_ping = Arc::clone(&stt);
+    let wg_guard_stt_ping = wg.add();
+    let stt_ping_task = tokio::spawn(async move {
+        let _wg_guard = wg_guard_stt_ping;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.tick().await; // Skip immediate tick
+        loop {
+            interval.tick().await;
+            if let Err(e) = stt_ping.send_ping().await {
+                info!("STT ping stopped: {}", e);
+                break;
+            }
+        }
+    });
+
+    // Spawn audio forwarding task: TTS events -> STT (must run concurrently!)
+    let stt_clone = Arc::clone(&stt);
+    let tts_clone = Arc::clone(&tts);
+    let wg_guard_audio = wg.add();
+    let audio_task = tokio::spawn(async move {
+        let _wg_guard = wg_guard_audio;
+        loop {
+            let event = match tts_clone.next_event().await {
+                Ok(e) => e,
+                Err(e) => {
+                    error!("TTS next_event error: {}", e);
+                    break;
+                }
+            };
+            match event {
+                TtsEvent::Audio { audio } => {
+                    let downsampled = downsample_48_to_24_base64(&audio);
+                    if let Err(e) = stt_clone.process(&downsampled).await {
+                        error!("Failed to process audio: {}", e);
+                        break;
+                    }
+                }
+                TtsEvent::TextEcho { text } => {
+                    info!("TTS text: {}", text);
+                }
+                TtsEvent::EndOfStream => {
+                    info!("TTS EndOfStream/Close received");
+                    break;
+                }
+                TtsEvent::Close => {
+                    info!("TTS Close received");
+                    break;
+                }
+                TtsEvent::Error { message, code: _ } => {
+                    error!("TTS error: {}", message);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        tts_clone.shutdown().await;
+    });
+
+    // Spawn text collection task: STT events -> full_text (must run concurrently!)
+    let full_text_clone = Arc::clone(&full_text);
+    let stt_clone2 = Arc::clone(&stt);
+    let wg_guard_text = wg.add();
+    let text_task = tokio::spawn(async move {
+        let _wg_guard = wg_guard_text;
+        loop {
+            let event = match stt_clone2.next_event().await {
+                Ok(e) => e,
+                Err(e) => {
+                    error!("STT next_event error: {}", e);
+                    break;
+                }
+            };
+            match event {
+                SttEvent::Text { text, .. } => {
+                    info!("STT text: {}", text);
+                    let mut full = full_text_clone.lock().await;
+                    full.push(' ');
+                    full.push_str(&text);
+                }
+                SttEvent::Step { vad, .. } => {
+                    let mut inactivity_prob = 0.0;
+                    if vad.len() > 2 {
+                        inactivity_prob = vad[2].inactivity_prob;
+                    }
+                    info!("STT step: inactivity_prob: {:.2}", inactivity_prob);
+                }
+                SttEvent::EndOfStream => {
+                    info!("STT EndOfStream received");
+                    break;
+                }
+                SttEvent::Close => {
+                    info!("STT Close received");
+                    break;
+                }
+                SttEvent::Error { message, code: _ } => {
+                    error!("STT error: {}", message);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        stt_clone2.shutdown().await;
+    });
+
+    // Original text to synthesize
+    let original_text = "Please describe physical properties of water";
+
+    // Send words one by one
+    for word in original_text.split_whitespace() {
+        tts.process(word).await.expect("Failed to enqueue text");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    tts.send_eos().await.expect("Failed to send EOS");
+    let _ = audio_task.await;
+
+    // Shutdown STT (sends EOS, triggers EndOfStream event)
+    stt.send_eos().await.expect("Failed to send EOS");
+    let _ = text_task.await;
+
+    // Stop ping tasks
+    tts_ping_task.abort();
+    stt_ping_task.abort();
+
+    wg.wait().await;
 }

@@ -21,7 +21,10 @@ pub enum SttEvent {
         /// Model name being used.
         model_name: String,
         /// Expected sample rate.
-        sample_rate: i32,
+        sample_rate: usize,
+
+        frame_size: usize,
+        delay_in_frames: usize,
     },
     /// A step of the STT process.
     Step {
@@ -91,6 +94,12 @@ impl SttConfig {
     }
 }
 
+pub struct SttSettings {
+    sample_rate: usize,
+    frame_size: usize,
+    delay_in_frames: usize,
+}
+
 /// Speech-to-Text client for streaming audio recognition.
 pub struct SttClient {
     config: SttConfig,
@@ -99,6 +108,8 @@ pub struct SttClient {
     error_count: Arc<AtomicU32>,
     stopping: Arc<AtomicBool>,
     session_id: String,
+
+    settings: RwLock<SttSettings>,
 }
 
 impl SttClient {
@@ -113,6 +124,11 @@ impl SttClient {
             error_count: Arc::new(AtomicU32::new(0)),
             stopping: Arc::new(AtomicBool::new(false)),
             session_id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
+            settings: RwLock::new(SttSettings {
+                sample_rate: 0,
+                frame_size: 0,
+                delay_in_frames: 0,
+            }),
         };
         client
     }
@@ -138,8 +154,18 @@ impl SttClient {
         loop {
             let event = self.next_event().await?;
             match event {
-                SttEvent::Ready { request_id, model_name, sample_rate } => {
-                    info!(request_id = %request_id, model_name = %model_name, sample_rate = sample_rate, "STT ready");
+                SttEvent::Ready { request_id, model_name, sample_rate, frame_size, delay_in_frames} => {
+                    info!(request_id = %request_id,
+                        model_name = %model_name,
+                        sample_rate = sample_rate,
+                        frame_size = frame_size,
+                        delay_in_frames = delay_in_frames,
+                        "STT ready");
+                    *self.settings.write().await = SttSettings {
+                        sample_rate: sample_rate as usize,
+                        frame_size: frame_size as usize,
+                        delay_in_frames: delay_in_frames as usize,
+                    };
                     self.ready.store(true, Ordering::SeqCst);
                     break;
                 }
@@ -219,6 +245,18 @@ impl SttClient {
         self.conn.read().await.as_ref().unwrap().send_text(&json).await
     }
 
+    pub async fn send_silence(&self) -> Result<(), Error> {
+        let silence_samples = {
+            let settings = self.settings.read().await;
+            settings.delay_in_frames * settings.frame_size
+        };
+        debug!("Sending STT silence with {} samples", silence_samples);
+        let silence_bytes = vec![0; silence_samples];
+        let audio = base64::encode(silence_bytes);
+        self.send_audio(&audio).await?;
+        Ok(())
+    }
+
     pub async fn send_eos(&self) -> Result<(), Error> {
         debug!("Sending STT EOS");
         self.stopping.store(true, Ordering::SeqCst);
@@ -289,7 +327,7 @@ impl SttClient {
                 let msg: SttReadyMessage = match serde_json::from_str(&text) {
                     Ok(m) => m,
                     Err(e) => {
-                        error!(error = %e, "Failed to parse ready message");
+                        error!(error = %e, text = %text, "Failed to parse ready message");
                         return Err(Error::InvalidJson);
                     }
                 };
@@ -304,6 +342,8 @@ impl SttClient {
                     request_id: msg.request_id,
                     model_name: msg.model_name,
                     sample_rate: msg.sample_rate,
+                    frame_size: msg.frame_size,
+                    delay_in_frames: msg.delay_in_frames,
                 })
             }
             "text" => {
