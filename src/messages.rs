@@ -172,7 +172,6 @@ pub struct SttReadyMessage {
 
     pub frame_size: usize,
 
-    #[serde(rename = "delay_in_tokens")]
     pub delay_in_frames: usize,
 
     pub text_stream_names: Vec<String>,
